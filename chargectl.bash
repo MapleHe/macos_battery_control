@@ -5,6 +5,7 @@ set -euo pipefail
 
 BIN=/Library/PrivilegedHelperTools/com.local.chargelimit
 CONF=/Library/Preferences/chargelimit.conf
+LOG=/var/db/chargelimit.log
 LABEL=com.local.chargelimit
 PLIST=/Library/LaunchDaemons/$LABEL.plist
 
@@ -21,7 +22,7 @@ usage() {
   sudo chargectl off            关闭限制（恢复正常充满）
   sudo chargectl on             启用限制；如果之前因"无效"被停用，清除后重新验证
   sudo chargectl discharge on   插电时电量高于上限，断开适配器供电放电到上限（默认开启）；off 关闭
-  chargectl log                 查看最近 2 小时的日志
+  chargectl log [N]             查看最近 N 行日志（默认 50）
 EOF
   else cat <<'EOF'
   chargectl status              show status
@@ -30,7 +31,7 @@ EOF
   sudo chargectl off            turn the limiter off (charge to full as usual)
   sudo chargectl on             turn the limiter on; clears a "had no effect" disable and re-verifies
   sudo chargectl discharge on   above the upper limit on AC, disconnect the adapter and discharge (default); off disables
-  chargectl log                 show the last 2 hours of logs
+  chargectl log [N]             show the last N log lines (default 50)
 EOF
   fi
 }
@@ -118,9 +119,9 @@ case "${1:-status}" in
            msg "插电放电已关闭" "Discharge off" ;;
       *)   die "用法: chargectl discharge on|off" "Usage: chargectl discharge on|off" ;;
     esac ;;
-  log)   # 安装后的进程名是 com.local.chargelimit；开发时直接运行编译产物则是 chargelimitd
-    log show --last 2h --style compact \
-      --predicate 'process == "com.local.chargelimit" OR process == "chargelimitd"' ;;
+  log)   # 守护进程自己写的日志文件（系统日志里也有同样的内容）
+    n=${2:-50}; is_int "$n"
+    tail -n "$n" "$LOG" 2>/dev/null || msg "还没有日志：$LOG" "No log yet: $LOG" ;;
   *)
     usage ;;
 esac

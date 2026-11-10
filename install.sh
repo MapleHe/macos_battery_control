@@ -43,7 +43,7 @@ safe_dir() {   # 以 root 运行的文件只能放在：路径上每一级都归
 if [[ "${1:-}" == "uninstall" ]]; then
   stop
   if [[ -x $DAEMON ]]; then sudo "$DAEMON" allow || true; fi   # 保险：守护进程没在运行时也恢复充电
-  sudo rm -f "$PLIST" "$DAEMON" "$CTL" /var/db/chargelimit.state "${OLD_FILES[@]}"
+  sudo rm -f "$PLIST" "$DAEMON" "$CTL" /var/db/chargelimit.state /var/db/chargelimit.log* "${OLD_FILES[@]}"
   msg "已卸载（配置文件 $CONF 保留）" "Uninstalled (config $CONF kept)"
   exit 0
 fi

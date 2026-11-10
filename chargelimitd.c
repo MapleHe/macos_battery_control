@@ -69,7 +69,10 @@ static void lang_init(void) {
 #define STALL_SEC   600    // 允许充电却持续不充电这么久 → 记日志、在 status 里提示
 #define FIGHT_N     10     // FIGHT_SEC 内键被外部改写这么多次 → 判定有其他程序争抢，退出
 #define FIGHT_SEC   600
-#define IO_FAIL_MAX 3      // 连续读写失败这么多次 → 退出
+#define IO_FAIL_MAX 3      // 连续读写失败这么多次 → 退出（断开适配器失败则停用放电）
+#define DPAUSE_SEC  600    // 断开适配器失败后，过这么久再重试
+#define LOG_PATH    "/var/db/chargelimit.log"
+#define LOG_MAX     (256 * 1024)
 
 // ---------------- SMC ----------------
 
@@ -190,9 +193,27 @@ static bool ctrl_write(const Ctrl *c, bool on) {   // 写入后回读确认
     return ctrl_read(c) == (on ? 1 : 0);
 }
 
+// 第一个键的原始值（十六进制），用于诊断写入失败
+static void ctrl_raw(const Ctrl *c, char *buf, size_t n) {
+    uint8_t b[32];
+    snprintf(buf, n, "?");
+    if (!smc_read(c->keys[0], c->size, b)) return;
+    for (uint32_t i = 0; i < c->size && 2 * i + 2 < n; i++) snprintf(buf + 2 * i, n - 2 * i, "%02x", b[i]);
+}
+
+static bool g_adapter_off;        // 当前已断开适配器供电（正在放电）
+
 static int  key_read(void)        { return ctrl_read(g_ctrl); }
 static bool key_write(bool on)    { return ctrl_write(g_ctrl, on); }
 static bool adapter_restore(void) { return !g_adapter || ctrl_write(g_adapter, false); }   // 恢复适配器供电
+
+// 恢复正常：先恢复适配器供电（最重要），再允许充电；两个都要执行，不能短路
+static bool restore_all(void) {
+    bool ok = adapter_restore();
+    ok = (g_ctrl && key_write(false)) && ok;
+    g_adapter_off = false;
+    return ok;
+}
 
 // ---------------- 电池 ----------------
 
@@ -259,6 +280,17 @@ static void fw_version(char *buf, size_t n) {
     if (!strncmp(buf, "iBoot-", 6)) memmove(buf, buf + 6, strlen(buf + 6) + 1);
 }
 
+typedef struct { char os[32], fw[48]; } Build;   // 系统版本（kern.osversion）+ 固件版本
+
+static Build build_now(void) {
+    Build b;
+    sysctl_str("kern.osversion", b.os, sizeof b.os);
+    fw_version(b.fw, sizeof b.fw);
+    return b;
+}
+
+static void stamp(time_t t, char *buf, size_t n) { strftime(buf, n, "%Y-%m-%d %H:%M:%S", localtime(&t)); }
+
 // ---------------- 配置 ----------------
 
 static bool g_conf_ignored;      // 配置文件属主或权限不安全，已忽略
@@ -289,6 +321,28 @@ static Conf conf_read(void) {
     return conf_sanitize(c);
 }
 
+// ---------------- 日志 ----------------
+// 同时写系统日志和 /var/db/chargelimit.log（chargectl log 读这个文件）。超过 LOG_MAX 时把旧文件改名为 .1。
+// 只有 root 能写；普通用户运行时只写系统日志。
+
+static void logm(int pri, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void logm(int pri, const char *fmt, ...) {
+    char msg[256], ts[24];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    syslog(pri, "%s", msg);
+
+    struct stat st;
+    if (stat(LOG_PATH, &st) == 0 && st.st_size > LOG_MAX) rename(LOG_PATH, LOG_PATH ".1");
+    int fd = open(LOG_PATH, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0644);
+    if (fd < 0) return;
+    stamp(time(NULL), ts, sizeof ts);
+    dprintf(fd, "%s %s%s\n", ts, pri <= LOG_ERR ? "ERROR " : pri == LOG_WARNING ? "WARN " : "", msg);
+    close(fd);
+}
+
 // ---------------- 状态文件 ----------------
 
 typedef struct {
@@ -302,6 +356,8 @@ typedef struct {
     long   verified;      // 最近一次写入并回读成功的时间
     int    functional;    // 1 = 已确认停充生效，0 = 尚未确认，-1 = 停充无效（停用）
     int    dfunctional;   // 插电放电：1 = 已确认断开适配器生效，0 = 尚未确认，-1 = 无效（只停用放电）
+    long   dpause;        // 插电放电暂停：0 = 没有，> 0 = 暂停到这个时间，-1 = 连续失败已停用（本次运行）
+    char   dfail[128];    // 最近一次断开适配器失败的情况（含读回的原始值）
     int    overrides;     // 键被外部改写的累计次数
     long   stall_since;   // "允许充电却不充"开始的时间；0 = 没有
     char   override[160]; // 最近一次外部改写的情况
@@ -333,6 +389,8 @@ static void state_load(State *s) {
         else if (!strcmp(k, "verified"))    s->verified = n;
         else if (!strcmp(k, "functional"))  s->functional = (int)n;
         else if (!strcmp(k, "dfunctional")) s->dfunctional = (int)n;
+        else if (!strcmp(k, "dpause"))      s->dpause = n;
+        else if (!strcmp(k, "dfail"))       snprintf(s->dfail, sizeof s->dfail, "%s", v);
         else if (!strcmp(k, "overrides"))   s->overrides = (int)n;
         else if (!strcmp(k, "stall_since")) s->stall_since = n;
         else if (!strcmp(k, "override"))    snprintf(s->override, sizeof s->override, "%s", v);
@@ -348,36 +406,38 @@ static void state_save(const State *s) {
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
     FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
     if (!f) {
-        syslog(LOG_ERR, "cannot write %s: %s", tmp, strerror(errno));
+        logm(LOG_ERR, "cannot write %s: %s", tmp, strerror(errno));
         if (fd >= 0) close(fd);
         return;
     }
     fchmod(fd, 0644);
     fprintf(f, "running=%d\npid=%d\nboot=%ld\ninhibited=%d\ncalibrating=%d\ntriggers=%d\n"
                "last_calib=%ld\ncalib_since=%ld\nos=%s\nfw=%s\nctrl=%s\nverified=%ld\n"
-               "functional=%d\ndfunctional=%d\noverrides=%d\nstall_since=%ld\noverride=%s\nlast=%s\n",
+               "functional=%d\ndfunctional=%d\ndpause=%ld\ndfail=%s\n"
+               "overrides=%d\nstall_since=%ld\noverride=%s\nlast=%s\n",
             s->running, s->pid, s->boot, s->p.inhibited, s->p.calibrating, s->p.triggers,
             (long)s->p.last_calib, (long)s->p.calib_since, s->os, s->fw, s->ctrl, s->verified,
-            s->functional, s->dfunctional, s->overrides, s->stall_since, s->override, s->last);
+            s->functional, s->dfunctional, s->dpause, s->dfail,
+            s->overrides, s->stall_since, s->override, s->last);
     bool ok = !ferror(f) && fflush(f) == 0 && fsync(fd) == 0;
     ok = (fclose(f) == 0) && ok;
     if (!ok)
-        syslog(LOG_ERR, "cannot write %s: %s", tmp, strerror(errno));
+        logm(LOG_ERR, "cannot write %s: %s", tmp, strerror(errno));
     else if (rename(tmp, STATE_PATH) != 0)
-        syslog(LOG_ERR, "cannot rename %s to %s: %s", tmp, STATE_PATH, strerror(errno));
+        logm(LOG_ERR, "cannot rename %s to %s: %s", tmp, STATE_PATH, strerror(errno));
     else
         return;
     unlink(tmp);
 }
 
 static void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void note(const char *fmt, ...) {   // 记到 syslog，同时作为状态文件里的"最近动作"
+static void note(const char *fmt, ...) {   // 记日志，同时作为状态文件里的"最近动作"
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_st.last, sizeof g_st.last, fmt, ap);
     va_end(ap);
     g_noted = true;
-    syslog(LOG_NOTICE, "%s", g_st.last);
+    logm(LOG_NOTICE, "%s", g_st.last);
 }
 
 // 记录的 pid 是否仍是我们的守护进程。进程名会被截断到 16 个字符，所以比较可执行文件的完整路径：
@@ -394,18 +454,15 @@ static bool daemon_alive(const State *s) {
 // 守护进程上次没有正常退出（崩溃、被 SIGKILL、断电）：先恢复适配器供电和充电，再执行这次的命令
 static void recover_if_crashed(State *s) {
     if (!s->running || daemon_alive(s)) return;
-    bool ok = adapter_restore();            // 两个都要执行，不能短路
-    ok = (g_ctrl && key_write(false)) && ok;
+    bool ok = restore_all();
     s->running = 0;
     note("previous daemon (pid %d) exited abnormally; adapter and charging reset%s", s->pid, ok ? "" : " FAILED");
     state_save(s);
 }
 
 static bool same_build(void) {   // 当前系统 + 固件版本与上次验证时相同
-    char os[32], fw[48];
-    sysctl_str("kern.osversion", os, sizeof os);
-    fw_version(fw, sizeof fw);
-    return !strcmp(os, g_st.os) && !strcmp(fw, g_st.fw);
+    Build b = build_now();
+    return !strcmp(b.os, g_st.os) && !strcmp(b.fw, g_st.fw);
 }
 
 // 方案 B：本系统 + 固件版本上已确认停充无效 → 不再写键
@@ -413,13 +470,10 @@ static bool fault_blocks(void) { return g_st.functional == -1 && same_build(); }
 
 // 记录本次验证：系统、固件版本或键变了，之前的功能验证结论作废（停充和放电都是）
 static void record_verified(void) {
-    char os[32], fw[48];
-    sysctl_str("kern.osversion", os, sizeof os);
-    fw_version(fw, sizeof fw);
-    if (strcmp(os, g_st.os) || strcmp(fw, g_st.fw) || strcmp(g_ctrl->name, g_st.ctrl))
-        g_st.functional = g_st.dfunctional = 0;
-    snprintf(g_st.os, sizeof g_st.os, "%s", os);
-    snprintf(g_st.fw, sizeof g_st.fw, "%s", fw);
+    Build b = build_now();
+    if (!same_build() || strcmp(g_ctrl->name, g_st.ctrl)) g_st.functional = g_st.dfunctional = 0;
+    snprintf(g_st.os, sizeof g_st.os, "%s", b.os);
+    snprintf(g_st.fw, sizeof g_st.fw, "%s", b.fw);
     snprintf(g_st.ctrl, sizeof g_st.ctrl, "%s", g_ctrl->name);
     g_st.verified = time(NULL);
 }
@@ -430,33 +484,27 @@ static int    g_written = -1;     // 本进程最后写入的值：1 停充，0 
 static int    g_prev_pct = -1, g_prev_ac = -1, g_io_fail, g_adapter_fail;
 static time_t g_full_since, g_check_at, g_dcheck_at, g_ac_change, g_wake_at;
 static bool   g_stall_logged;
-static bool   g_adapter_ok;       // 本次运行允许插电放电（有键、未被判定无效、断开没失败过）
-static bool   g_adapter_off;      // 当前已断开适配器供电（正在放电）
+static int    g_dfail;            // 连续断开适配器失败的次数
 static time_t g_fights[FIGHT_N];  // 最近几次外部改写的时间（环形）
 static int    g_fight_i;
 
-// 退出前恢复正常：先恢复适配器供电（最重要），再允许充电
-static bool restore_all(void) {
-    bool ok = adapter_restore();
-    ok = (g_ctrl && key_write(false)) && ok;
-    g_adapter_off = false;
-    return ok;
-}
-
-static void fatal(const char *why) __attribute__((noreturn));
-static void fatal(const char *why) {     // 恢复正常并退出（exit 0，launchd 不会立即重启）
+// 恢复正常并退出（exit 0，launchd 不会立即重启）。用户停止（信号）和出错（fatal）都走这里。
+static void finish(const char *why) __attribute__((noreturn));
+static void finish(const char *why) {
     bool ok = restore_all();
-    syslog(LOG_ERR, "%s", why);
     note("stopped: %s; adapter and charging re-enabled%s", why, ok ? "" : " FAILED");
     g_st.running = 0;
     state_save(&g_st);
     exit(0);
 }
 
+static void fatal(const char *why) __attribute__((noreturn));
+static void fatal(const char *why) { logm(LOG_ERR, "%s", why); finish(why); }
+
 static bool apply(bool on, const Batt *b, const char *why) {
     if (!key_write(on)) {
         g_written = -1;                  // 写了一半也有可能，值未知
-        syslog(LOG_ERR, "SMC write/readback failed (%s)", why);
+        logm(LOG_ERR, "SMC write/readback failed (%s)", why);
         return false;
     }
     g_written = on;
@@ -469,12 +517,12 @@ static long ago(time_t t, time_t now) { return t ? (long)(now - t) : -1; }
 
 static void on_override(int actual, int expected, const Batt *b, time_t now) {
     char ts[24];
-    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&now));
+    stamp(now, ts, sizeof ts);
     g_st.overrides++;
     snprintf(g_st.override, sizeof g_st.override,
              "%s value %d (expected %d), %s, %lds since plug change, %lds since wake",
              ts, actual, expected, b->ac ? "on AC" : "on battery", ago(g_ac_change, now), ago(g_wake_at, now));
-    syslog(LOG_WARNING, "charging key changed externally: %s", g_st.override);
+    logm(LOG_WARNING, "charging key changed externally: %s", g_st.override);
     time_t oldest = g_fights[g_fight_i];
     g_fights[g_fight_i] = now;
     g_fight_i = (g_fight_i + 1) % FIGHT_N;
@@ -489,6 +537,29 @@ static void adapter_set(bool off, int pct, int upper) {
     else     note("power adapter reconnected at %d%%", pct);
 }
 
+// 现在可以断开适配器吗：有键、本系统 + 固件上没被判定无效、没有因写入失败而暂停或停用
+static bool discharge_ready(time_t now) {
+    return g_adapter && g_st.dfunctional != -1 && g_st.dpause != -1 && g_st.dpause <= now;
+}
+
+// 断开失败：记下读回的原始值，恢复供电，暂停 10 分钟后重试；连续失败 3 次则停用，直到 discharge on 或重启
+static void discharge_failed(time_t now) {
+    char raw[16], ts[24];
+    ctrl_raw(g_adapter, raw, sizeof raw);
+    if (adapter_restore()) { g_adapter_off = false; g_prev_ac = -1; }
+    stamp(now, ts, sizeof ts);
+    g_dfail++;
+    snprintf(g_st.dfail, sizeof g_st.dfail, "%s %s read back %s after writing %02x (%d/%d)",
+             ts, g_adapter->name, raw, g_adapter->on, g_dfail, IO_FAIL_MAX);
+    if (g_dfail >= IO_FAIL_MAX) {
+        g_st.dpause = -1;
+        note("discharge disabled: %s; run 'sudo chargectl discharge on' to retry", g_st.dfail);
+    } else {
+        g_st.dpause = now + DPAUSE_SEC;
+        note("discharge paused for %d min: %s", DPAUSE_SEC / 60, g_st.dfail);
+    }
+}
+
 // 插电放电：先确认上次断开是否生效，再让适配器键与期望一致
 static void adapter_step(const Conf *c, const Batt *b, time_t now) {
     if (!g_adapter) return;
@@ -498,27 +569,25 @@ static void adapter_step(const Conf *c, const Batt *b, time_t now) {
         g_dcheck_at = 0;
         if (g_adapter_off && b->ac) {
             g_st.dfunctional = -1;
-            g_adapter_ok = false;
             if (adapter_restore()) { g_adapter_off = false; g_prev_ac = -1; }
             note("discharge disabled: still on AC after setting %s; run 'sudo chargectl discharge on' to retry",
                  g_adapter->name);
         } else if (g_adapter_off) {
             g_st.dfunctional = 1;
-            syslog(LOG_NOTICE, "verified: macOS runs on battery when %s is set", g_adapter->name);
+            logm(LOG_NOTICE, "verified: macOS runs on battery when %s is set", g_adapter->name);
         }
     }
 
-    bool want = g_adapter_ok && policy_discharge(c, &g_st.p, b->pct, g_adapter_off, b->ac);
+    bool want = discharge_ready(now) && policy_discharge(c, &g_st.p, b->pct, g_adapter_off, b->ac);
     if (ctrl_read(g_adapter) == (int)want) { g_adapter_off = want; g_adapter_fail = 0; return; }
 
     if (ctrl_write(g_adapter, want)) {
         g_adapter_fail = 0;
+        if (want) { g_dfail = 0; g_st.dpause = 0; }
         if (want != g_adapter_off) adapter_set(want, b->pct, c->upper);
         g_dcheck_at = want && b->ac && g_st.dfunctional != 1 ? now + VERIFY_SEC : 0;
-    } else if (want) {            // 断开失败：本次运行不再放电，并确保供电恢复
-        g_adapter_ok = false;
-        syslog(LOG_ERR, "cannot set %s; discharge disabled until restart", g_adapter->name);
-        if (adapter_restore()) g_adapter_off = false;
+    } else if (want) {
+        discharge_failed(now);
     } else if (++g_adapter_fail >= IO_FAIL_MAX) {
         fatal("cannot reconnect the power adapter");
     }
@@ -573,7 +642,7 @@ static void tick(bool after_wake) {
                 fatal("key written but battery is still charging; disabled until 'sudo chargectl on'");
             }
             g_st.functional = 1;
-            syslog(LOG_NOTICE, "verified: charging stops when %s is set", g_ctrl->name);
+            logm(LOG_NOTICE, "verified: charging stops when %s is set", g_ctrl->name);
         }
     }
 
@@ -616,7 +685,7 @@ static void pm_cb(void *ref, io_service_t s, uint32_t msg, void *arg) {
             Conf c = conf_read(); Batt b = batt_read();
             if (g_adapter_off) {
                 if (!adapter_restore() && !adapter_restore())
-                    syslog(LOG_ERR, "cannot reconnect the power adapter before sleep");
+                    logm(LOG_ERR, "cannot reconnect the power adapter before sleep");
                 else adapter_set(false, b.ok ? b.pct : -1, c.upper);
                 g_dcheck_at = 0;
                 state_save(&g_st);
@@ -652,7 +721,7 @@ static int run_daemon(void) {
         return 0;
     }
     recover_if_crashed(&g_st);
-    if (!adapter_restore()) syslog(LOG_ERR, "cannot reconnect the power adapter at startup");
+    if (!adapter_restore()) logm(LOG_ERR, "cannot reconnect the power adapter at startup");
     if (!g_ctrl) fatal("no supported SMC charging key (the firmware may block it)");
     if (fault_blocks()) {
         g_st.running = 0;
@@ -664,34 +733,29 @@ static int run_daemon(void) {
     // 启动验证：写"允许充电"并回读
     if (!key_write(false)) fatal("startup check failed: cannot write/read back the charging key");
     g_written = 0;
-    record_verified();            // 系统或固件变了会把 dfunctional 清零，所以放电的判断在它之后
-    g_adapter_ok = g_adapter && g_st.dfunctional != -1;
+    record_verified();            // 系统或固件变了会把 dfunctional 清零
+    g_st.dpause = 0;              // 写入失败造成的暂停只在一次运行内有效
 
     g_st.running = 1;
     g_st.pid = getpid();
     g_st.boot = boot_time();
     Conf c = conf_read();
-    if (g_conf_ignored) syslog(LOG_WARNING, "ignoring %s: must be root-owned and not writable by others", CONF_PATH);
+    if (g_conf_ignored) logm(LOG_WARNING, "ignoring %s: must be root-owned and not writable by others", CONF_PATH);
     if (policy_on_start(&c, &g_st.p, time(NULL))) note("calibration started at startup");
     else note("started, keys %s / %s, macOS %s, firmware %s", g_ctrl->name,
               g_adapter ? g_adapter->name : "no adapter key", g_st.os, g_st.fw);
     state_save(&g_st);
 
-    void (^quit)(void) = ^{   // 用户主动停止（launchctl bootout、卸载、关机）：恢复适配器供电和充电
-        bool ok = restore_all();
-        g_st.running = 0;
-        note("stopped by signal; adapter and charging re-enabled%s", ok ? "" : " FAILED");
-        state_save(&g_st);
-        exit(0);
-    };
-    dispatch_source_t s1 = on_signal(SIGTERM, quit);
-    dispatch_source_t s2 = on_signal(SIGINT, quit);
-    dispatch_source_t s3 = on_signal(SIGHUP, ^{ tick(false); });   // chargectl 改配置后发 HUP
-    dispatch_source_t s4 = on_signal(SIGUSR1, ^{                    // chargectl on / discharge on：重试放电
-        if (!g_adapter || (g_adapter_ok && g_st.dfunctional != -1)) return;
-        g_st.dfunctional = 0;
-        g_adapter_ok = true;
-        note("discharge re-enabled by user; will verify again");
+    // 用户主动停止（launchctl bootout、卸载、关机）：恢复适配器供电和充电后退出
+    dispatch_source_t s1 = on_signal(SIGTERM, ^{ finish("signal"); });
+    dispatch_source_t s2 = on_signal(SIGINT,  ^{ finish("signal"); });
+    dispatch_source_t s3 = on_signal(SIGHUP,  ^{ tick(false); });   // chargectl 改配置后发 HUP
+    dispatch_source_t s4 = on_signal(SIGUSR1, ^{                     // chargectl on / discharge on：重试放电
+        if (!g_adapter || (g_st.dfunctional != -1 && !g_st.dpause)) return;
+        if (g_st.dfunctional == -1) g_st.dfunctional = 0;
+        g_st.dpause = 0;
+        g_dfail = 0;
+        note("discharge re-enabled by user");
         state_save(&g_st);
         tick(false);
     });
@@ -736,11 +800,10 @@ static bool os_at_least(int major, int minor) {
 
 static int print_status(bool smc) {
     time_t now = time(NULL);
-    char os[32], ver[32], fw[48], t1[32], t2[32];
-    sysctl_str("kern.osversion", os, sizeof os);
+    char ver[32], t1[32], t2[32];
+    Build bd = build_now();
     sysctl_str("kern.osproductversion", ver, sizeof ver);
-    fw_version(fw, sizeof fw);
-    printf(L("系统       : macOS %s (%s)   固件: %s\n", "System      : macOS %s (%s)   firmware: %s\n"), ver, os, fw);
+    printf(L("系统       : macOS %s (%s)   固件: %s\n", "System      : macOS %s (%s)   firmware: %s\n"), ver, bd.os, bd.fw);
 
     printf("%s", L("充电控制键 : ", "Charge key  : "));
     if (!smc)        printf("%s\n", L("无法打开 AppleSMC", "cannot open AppleSMC"));
@@ -773,6 +836,7 @@ static int print_status(bool smc) {
         printf(L("%s%s 属主或权限不安全，已忽略，正在使用默认值\n", "%s%s has unsafe owner/permissions; ignored, using defaults\n"),
                INDENT, CONF_PATH);
 
+    bool alive = daemon_alive(&g_st);   // 暂停 / 停用只在守护进程运行期间有意义
     printf("%s", L("插电放电   : ", "Discharge   : "));
     if (!c.discharge)
         printf("%s\n", L("关闭", "off"));
@@ -782,14 +846,21 @@ static int print_status(bool smc) {
         printf("%s\n", L("已停用：断开适配器在本系统和固件上无效（sudo chargectl discharge on 可重试）",
                          "disabled: disconnecting the adapter had no effect on this macOS/firmware "
                          "(retry: sudo chargectl discharge on)"));
-    else if (a == 1)
+    else if (alive && g_st.dpause == -1)
+        printf("%s\n", L("已停用：断开适配器连续失败（sudo chargectl discharge on 可重试）",
+                         "disabled: disconnecting the adapter kept failing (retry: sudo chargectl discharge on)"));
+    else if (alive && g_st.dpause > now) {
+        fmt_dur(g_st.dpause - now, t1, sizeof t1);
+        printf(L("暂停：断开适配器失败，%s后重试\n", "paused: disconnecting the adapter failed; retry in %s\n"), t1);
+    } else if (a == 1)
         printf(L("进行中：已断开适配器供电（%s），放电到 %d%%\n", "in progress: adapter disconnected (%s), discharging to %d%%\n"),
                g_adapter->name, c.upper - 1);
     else
         printf(L("待命（%s）：接着电源且电量高于上限时放电%s\n", "standby (%s): discharges when on AC and above the upper limit%s\n"),
                g_adapter->name, g_st.dfunctional == 1 ? L("，已确认生效", ", confirmed working") : "");
+    if (c.discharge && g_st.dfail[0])
+        printf(L("%s最近一次失败：%s\n", "%slast failure: %s\n"), INDENT, g_st.dfail);
 
-    bool alive = daemon_alive(&g_st);
     printf("%s%s\n", L("守护进程   : ", "Daemon      : "),
            alive ? L("运行中", "running")
            : g_st.running ? L("上次异常退出（下次以 root 运行任何命令时会先复位）",
@@ -832,7 +903,7 @@ static int print_status(bool smc) {
                t1, g_st.os, g_st.fw, g_st.ctrl,
                g_st.functional == 1  ? L("，已确认停充生效", ", stopping charge confirmed")
                : g_st.functional == -1 ? L("，停充无效", ", stopping charge had no effect") : "");
-        if (strcmp(os, g_st.os) || strcmp(fw, g_st.fw))
+        if (!same_build())
             printf("%s%s\n", INDENT, L("系统或固件已更新，守护进程下次启动时会重新验证",
                                        "macOS or firmware changed; the daemon re-verifies on its next start"));
     }
@@ -943,7 +1014,7 @@ static int adapter_test(int secs) {
     printf(L("将断开适配器供电 %d 秒，Ctrl+C 可提前结束，结束时一定恢复。\n\n",
              "Disconnecting the adapter for %d s; Ctrl+C ends early; it is always reconnected.\n\n"), secs);
     show(0, L("断开前", "before"));
-    syslog(LOG_NOTICE, "adaptertest: disconnecting adapter via %s for %d s", g_adapter->name, secs);
+    logm(LOG_NOTICE, "adaptertest: disconnecting adapter via %s for %d s", g_adapter->name, secs);
     bool wrote = ctrl_write(g_adapter, true);
     bool on_battery = false;
     int min_ma = 0;
@@ -957,7 +1028,7 @@ static int adapter_test(int secs) {
     }
 
     ok = adapter_restore() || adapter_restore();
-    syslog(LOG_NOTICE, "adaptertest: adapter reconnected%s", ok ? "" : " FAILED");
+    logm(LOG_NOTICE, "adaptertest: adapter reconnected%s", ok ? "" : " FAILED");
     sleep(3);
     show(secs, L("恢复后", "after"));
 
