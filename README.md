@@ -141,7 +141,7 @@ battery readings, state persistence and launchd integration.
 This tool writes undocumented SMC keys whose meaning Apple may change at any time. It
 includes the safeguards above, but use it at your own risk. Not affiliated with Apple.
 The approach follows open-source tools. Codes were generated using Claude Opus 5.5 
-Mediumn.
+Medium.
 
 ## License
 
