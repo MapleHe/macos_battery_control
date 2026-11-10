@@ -1,6 +1,6 @@
 # chargelimit
 
-A small battery charge limiter for Apple Silicon MacBooks (macOS 15 - 26), in the spirit of AlDente:
+A small battery charge limiter for Apple Silicon MacBooks, in the spirit of AlDente:
 stop charging at an **upper** limit, resume at a **lower** limit, and calibrate the
 battery gauge from time to time.
 
@@ -14,12 +14,19 @@ It is one C daemon, one shell command and a launchd plist — no app, no network
 | ≤ lower | charging resumes |
 | in between | the current state is kept (hysteresis) |
 
-Charging is controlled through undocumented SMC keys, detected at run time:
+**Discharge on AC** (on by default). Stopping charge alone can't bring the level down while
+plugged in. So when the Mac is on AC and above the upper limit, the daemon disconnects the
+power adapter, lets the Mac run from the battery down to one below the upper limit, then
+reconnects the adapter with charging still stopped.
 
-| Key | Firmware | Stop / allow |
-|---|---|---|
-| `CHTE` (4 bytes) | newer | `01000000` / `00000000` |
-| `CH0B` + `CH0C` (1 byte) | older | `02` / `00` |
+Charging and the adapter are controlled through undocumented SMC keys, detected at run time:
+
+| Key | Firmware | Purpose | On / off |
+|---|---|---|---|
+| `CHTE` (4 bytes) | newer | stop charging | `01000000` / `00000000` |
+| `CH0B` + `CH0C` (1 byte) | older | stop charging | `02` / `00` |
+| `CHIE` (1 byte) | newer | disconnect adapter | `08` / `00` |
+| `CH0I` (1 byte) | older | disconnect adapter | `01` / `00` |
 
 **Calibration.** After the limit has been reached `calib_every` times (default 3), or
 `calib_days` days after the last calibration (default 30), the next charge goes to 100%.
@@ -37,11 +44,29 @@ firmware shipped from macOS 27 beta 4 on, where Apple gates these keys behind a 
 entitlement. In that case the installer refuses to install; on macOS 26.4+ use the
 built-in Charge Limit in System Settings → Battery instead.
 
+## Check your Mac first (optional)
+
+Build in the source folder and try the keys by hand, without installing anything:
+
+```bash
+clang -O2 -o chargelimitd chargelimitd.c -framework IOKit -framework CoreFoundation
+./chargelimitd probe                  # read-only: which keys exist, their size and value
+sudo ./chargelimitd adaptertest 60    # disconnect the adapter for 60 s, then reconnect
+```
+
+`adaptertest` needs the adapter plugged in and at least 30% battery. It always reconnects
+the adapter at the end, on Ctrl+C, or below 25%. If anything interrupts it, run
+`sudo ./chargelimitd adaptertest 0` to reconnect. The battery current it shows refreshes
+about once a minute, so short tests may report "unclear".
+
 ## Install
 
 ```bash
 bash install.sh
 ```
+
+To install with discharging off, add `discharge=0` to `/Library/Preferences/chargelimit.conf`
+before running the installer, and turn it on later with `sudo chargectl discharge on`.
 
 The installer compiles the daemon, checks that a supported key exists, verifies that every
 directory it installs into is root-owned and not writable by others, and loads the daemon.
@@ -59,6 +84,7 @@ sudo chargectl set 80 60      # upper 80%, lower 60% (also turns the limiter on)
 sudo chargectl calib 3 30     # calibrate every 3 limits or 30 days; 0 turns a condition off
 sudo chargectl off            # stop limiting (charge to full as usual)
 sudo chargectl on             # limit again; also clears a "had no effect" disable
+sudo chargectl discharge off  # don't discharge on AC (on turns it back on)
 chargectl log                 # last 2 hours of logs
 ```
 
@@ -69,6 +95,10 @@ English. Logs are always in English.
 
 ## What happens when…
 
+**You stay plugged in above the upper limit.** The adapter is disconnected and the Mac
+runs from the battery down to one below the upper limit, then the adapter is reconnected.
+`chargectl status` shows "battery (adapter disconnected)" meanwhile.
+
 **You unplug.** Nothing changes; the battery discharges as usual. If you plug back in
 between the limits, it does not charge until the level drops to the lower limit.
 
@@ -76,12 +106,13 @@ between the limits, it does not charge until the level drops to the lower limit.
 plugged in charges to 100%. After boot, charging stops again if the level is above the
 upper limit. Holding 100% on AC for 5 minutes after boot counts as a calibration.
 
-**You close the lid.** The daemon does not run during sleep. If it was charging toward the
-upper limit, it pauses charging at the current level and resumes on wake. Below the lower
-limit, or while calibrating, charging continues and may reach 100%.
+**You close the lid.** The daemon does not run during sleep. If it was discharging, it
+reconnects the adapter first (charging stays stopped) and continues after wake. If it was
+charging toward the upper limit, it pauses charging at the current level and resumes on
+wake. Below the lower limit, or while calibrating, charging continues and may reach 100%.
 
-**The daemon crashes or is killed.** launchd restarts it; on start it first restores normal
-charging, then applies the limits again.
+**The daemon crashes or is killed.** launchd restarts it (within about a minute); on start
+it first reconnects the adapter and restores normal charging, then applies the limits again.
 
 ## Safety
 
@@ -89,6 +120,11 @@ charging, then applies the limits again.
   later that the battery really stopped charging. If not, it re-enables charging, disables
   itself for this macOS + firmware version, and stays off until `sudo chargectl on` or a
   system update.
+- The adapter is reconnected on every exit path (signal, error, restart after a crash, boot)
+  and before sleep, and discharging never goes below one under the upper limit. The first
+  time the adapter is disconnected, the daemon checks 60 s later that macOS really runs on
+  battery; if not, it disables only discharging for this macOS + firmware version, until
+  `sudo chargectl discharge on`.
 - Keys with an unexpected size are never written.
 - If another program keeps changing the key (10 times in 10 minutes), the daemon
   re-enables charging and exits.
@@ -114,6 +150,7 @@ upper=80
 lower=60
 calib_every=3
 calib_days=30
+discharge=1
 ```
 
 ## Uninstall
@@ -122,7 +159,7 @@ calib_days=30
 bash install.sh uninstall
 ```
 
-Charging is re-enabled and all files except the config are removed.
+The adapter and charging are re-enabled and all files except the config are removed.
 
 ## Development
 
@@ -132,6 +169,10 @@ clang -O2 -Wall -Wextra -o chargelimitd chargelimitd.c -framework IOKit -framewo
 ./chargelimitd status
 ```
 
+Commands of the daemon binary itself: `status`, `probe` (no root needed); `run`, `inhibit`,
+`allow`, `clearfault`, `adaptertest [s]` (root). `inhibit` and `allow` refuse to run while
+the daemon is running.
+
 `policy.h` holds the decision logic (limits, calibration, key reconciliation) with no
 macOS dependencies, so it can be unit-tested anywhere. `chargelimitd.c` adds SMC access,
 battery readings, state persistence and launchd integration.
@@ -140,8 +181,7 @@ battery readings, state persistence and launchd integration.
 
 This tool writes undocumented SMC keys whose meaning Apple may change at any time. It
 includes the safeguards above, but use it at your own risk. Not affiliated with Apple.
-The approach follows open-source tools. Codes were generated using Claude Opus 5.5 
-Medium.
+The approach follows open-source tools. Codes were generated by Claude Opus 5.5 Medium.
 
 ## License
 

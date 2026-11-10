@@ -19,7 +19,8 @@ usage() {
   sudo chargectl set 80 60      上限 80%，下限 60%（同时启用限制）
   sudo chargectl calib 3 30     每触发上限 3 次或每 30 天校准一次（充到 100% 保持 5 分钟）；0 = 关闭该条件
   sudo chargectl off            关闭限制（恢复正常充满）
-  sudo chargectl on             启用限制；如果之前因"停充无效"被停用，清除后重新验证
+  sudo chargectl on             启用限制；如果之前因"无效"被停用，清除后重新验证
+  sudo chargectl discharge on   插电时电量高于上限，断开适配器供电放电到上限（默认开启）；off 关闭
   chargectl log                 查看最近 2 小时的日志
 EOF
   else cat <<'EOF'
@@ -28,6 +29,7 @@ EOF
   sudo chargectl calib 3 30     calibrate (charge to 100% and hold 5 min) every 3 limits or 30 days; 0 = off
   sudo chargectl off            turn the limiter off (charge to full as usual)
   sudo chargectl on             turn the limiter on; clears a "had no effect" disable and re-verifies
+  sudo chargectl discharge on   above the upper limit on AC, disconnect the adapter and discharge (default); off disables
   chargectl log                 show the last 2 hours of logs
 EOF
   fi
@@ -45,7 +47,8 @@ get() {   # get <键> <默认值>：只接受整数，其他一律用默认值
   if [[ $v =~ ^[0-9]+$ ]]; then echo "$v"; else echo "$2"; fi
 }
 
-save() {   # save <enabled> <upper> <lower> <calib_every> <calib_days>
+RUNNING=   # save() 之后：守护进程原本就在运行（HUP 送达）
+save() {   # save <enabled> <upper> <lower> <calib_every> <calib_days> <discharge>
   local dir uid mode tmp
   dir=$(dirname "$CONF")
   read -r uid mode < <(stat -f '%u %Lp' "$dir") || die "无法读取目录属性：$dir" "Cannot stat $dir"
@@ -53,19 +56,24 @@ save() {   # save <enabled> <upper> <lower> <calib_every> <calib_days>
     die "拒绝写入：$dir 不是 root 所有或对他人可写" "Refusing to write: $dir is not root-owned or is writable by others"
   fi
   tmp=$(mktemp "$CONF.XXXXXX") || die "无法创建临时文件" "Cannot create a temporary file"   # 随机名 + O_EXCL
-  if ! printf "enabled=%d\nupper=%d\nlower=%d\ncalib_every=%d\ncalib_days=%d\n" "$@" > "$tmp" \
+  if ! printf "enabled=%d\nupper=%d\nlower=%d\ncalib_every=%d\ncalib_days=%d\ndischarge=%d\n" "$@" > "$tmp" \
      || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$CONF"; then                 # rename 不跟随链接
     rm -f "$tmp"; die "写入配置失败" "Failed to write the config"
   fi
   # 守护进程在运行 → HUP 立即生效（它也每 30 秒重读配置）；进程已退出但服务已加载 → 启动它
-  launchctl kill HUP "system/$LABEL" 2>/dev/null \
-    || launchctl kickstart "system/$LABEL" 2>/dev/null \
-    || msg "（守护进程未加载，配置已保存。加载：sudo launchctl bootstrap system $PLIST）" \
-           "(The daemon is not loaded; config saved. Load it: sudo launchctl bootstrap system $PLIST)"
+  if launchctl kill HUP "system/$LABEL" 2>/dev/null; then RUNNING=1
+  elif ! launchctl kickstart "system/$LABEL" 2>/dev/null; then
+    msg "（守护进程未加载，配置已保存。加载：sudo launchctl bootstrap system $PLIST）" \
+        "(The daemon is not loaded; config saved. Load it: sudo launchctl bootstrap system $PLIST)"
+  fi
+}
+
+retry_discharge() {   # 让运行中的守护进程清除放电的停用状态；没在运行时 clearfault 已清除状态文件
+  [[ $RUNNING ]] && launchctl kill USR1 "system/$LABEL" 2>/dev/null || true
 }
 
 en=$(get enabled 1); up=$(get upper 80); lo=$(get lower 60)
-ce=$(get calib_every 3); cdays=$(get calib_days 30)
+ce=$(get calib_every 3); cdays=$(get calib_days 30); dis=$(get discharge 1)
 
 case "${1:-status}" in
   status)
@@ -77,7 +85,7 @@ case "${1:-status}" in
     is_int "$up"; is_int "$lo"
     (( up >= 20 && up <= 100 )) || die "上限需在 20–100" "Upper must be 20–100"
     (( lo >= 5 && lo <= up - 5 )) || die "下限需 >= 5 且比上限至少低 5" "Lower must be >= 5 and at least 5 below upper"
-    save 1 "$up" "$lo" "$ce" "$cdays"
+    save 1 "$up" "$lo" "$ce" "$cdays" "$dis"
     msg "已设置：上限 ${up}%，下限 ${lo}%" "Set: upper ${up}%, lower ${lo}%" ;;
   calib)
     admin
@@ -86,18 +94,30 @@ case "${1:-status}" in
     is_int "$ce"; is_int "$cdays"
     (( ce <= 50 ))     || die "次数需在 0–50" "Limits must be 0–50"
     (( cdays <= 365 )) || die "天数需在 0–365" "Days must be 0–365"
-    save "$en" "$up" "$lo" "$ce" "$cdays"
+    save "$en" "$up" "$lo" "$ce" "$cdays" "$dis"
     msg "已设置：校准条件 次数 ${ce}（0 = 不按次数），天数 ${cdays}（0 = 不按天数）" \
         "Set: calibrate every ${ce} limits (0 = off) or ${cdays} days (0 = off)" ;;
   on)
     admin
     "$BIN" clearfault
-    save 1 "$up" "$lo" "$ce" "$cdays"
+    save 1 "$up" "$lo" "$ce" "$cdays" "$dis"
+    retry_discharge
     msg "限制已启用" "Limiter on" ;;
   off)
     admin
-    save 0 "$up" "$lo" "$ce" "$cdays"
+    save 0 "$up" "$lo" "$ce" "$cdays" "$dis"
     msg "限制已关闭" "Limiter off" ;;
+  discharge)
+    admin
+    case "${2:-}" in
+      on)  "$BIN" clearfault
+           save "$en" "$up" "$lo" "$ce" "$cdays" 1
+           retry_discharge
+           msg "插电放电已开启" "Discharge on" ;;
+      off) save "$en" "$up" "$lo" "$ce" "$cdays" 0
+           msg "插电放电已关闭" "Discharge off" ;;
+      *)   die "用法: chargectl discharge on|off" "Usage: chargectl discharge on|off" ;;
+    esac ;;
   log)   # 安装后的进程名是 com.local.chargelimit；开发时直接运行编译产物则是 chargelimitd
     log show --last 2h --style compact \
       --predicate 'process == "com.local.chargelimit" OR process == "chargelimitd"' ;;

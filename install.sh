@@ -70,7 +70,7 @@ sudo install -m 755 -o root -g wheel chargectl.bash "$CTL"
 if [[ ! -f $CONF ]]; then
   tmp=$(mktemp)
   if [[ -f $OLD_CONF ]]; then cp "$OLD_CONF" "$tmp"          # 迁移旧配置（缺的项用默认值）
-  else printf "enabled=1\nupper=80\nlower=60\ncalib_every=3\ncalib_days=30\n" > "$tmp"; fi
+  else printf "enabled=1\nupper=80\nlower=60\ncalib_every=3\ncalib_days=30\ndischarge=1\n" > "$tmp"; fi
   sudo install -m 644 -o root -g wheel "$tmp" "$CONF"
   rm -f "$tmp"
   if [[ -f $OLD_CONF ]]; then   # 旧目录可能曾被他人改写，内容要人工看一眼

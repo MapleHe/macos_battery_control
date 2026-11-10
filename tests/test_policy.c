@@ -10,7 +10,7 @@ static int    prev;
 static time_t T, full;
 
 static void reset(void) {
-    C = (Conf){ .enabled = true, .upper = 80, .lower = 60, .calib_every = 3, .calib_days = 30 };
+    C = (Conf){ .enabled = true, .upper = 80, .lower = 60, .calib_every = 3, .calib_days = 30, .discharge = true };
     memset(&P, 0, sizeof P);
     prev = -1; full = 0; T = 1000000;
     policy_on_start(&C, &P, T);
@@ -155,8 +155,29 @@ int main(void) {
     o.charging = true;
     assert(!charge_stalled(&cp, true, &o));
 
+    // 插电放电：接电且 > 上限才开始；开始后降到上限 - 1 才停；回弹到上限不再触发
+    reset();
+    assert(!policy_discharge(&C, &P, 80, false, true));
+    assert( policy_discharge(&C, &P, 95, false, true));
+    assert(!policy_discharge(&C, &P, 95, false, false));     // 没接电不开始
+    assert( policy_discharge(&C, &P, 80, true,  false));     // 进行中不看 ac，到 80 还继续
+    assert(!policy_discharge(&C, &P, 79, true,  false));     // 79 停
+    assert(!policy_discharge(&C, &P, 80, false, true));      // 回弹到 80 不再开始
+    // 校准、关闭限制、关闭放电：都不放电（进行中的也要停）
+    P.calibrating = true;
+    assert(!policy_discharge(&C, &P, 95, true, true));
+    P.calibrating = false; C.enabled = false;
+    assert(!policy_discharge(&C, &P, 95, true, true));
+    C.enabled = true; C.discharge = false;
+    assert(!policy_discharge(&C, &P, 95, true, true));
+    // 校准完成后（100%，已停充）开始放电回到上限
+    reset();
+    P.calibrating = true;
+    hold_full(11);
+    assert(!P.calibrating && P.inhibited && policy_discharge(&C, &P, 100, false, true));
+
     // 配置边界
-    Conf b = conf_sanitize((Conf){ true, 150, 99, 80, 999 });
+    Conf b = conf_sanitize((Conf){ true, 150, 99, 80, 999, true });
     assert(b.upper == 100 && b.lower == 95 && b.calib_every == 50 && b.calib_days == 365);
 
     puts("policy tests passed");

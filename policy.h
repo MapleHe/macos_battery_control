@@ -12,6 +12,7 @@ typedef struct {
     int  upper, lower;
     int  calib_every;           // 触发上限多少次后校准；0 = 不按次数
     int  calib_days;            // 距上次校准多少天后校准；0 = 不按天数
+    bool discharge;             // 插电时电量高于上限 → 断开适配器供电，放电到上限以下
 } Conf;
 
 // 需要跨重启保存的策略状态
@@ -146,6 +147,15 @@ static inline int key_sync(int actual, int *written, bool desired, bool after_wa
 // 校准期间要到 100%，所以阈值是 100；平时到 95% 以上不充是正常现象。
 static inline bool charge_stalled(const Policy *p, bool key_allows, const Obs *o) {
     return key_allows && o->ac && !o->charging && o->pct < (p->calibrating ? 100 : 95);
+}
+
+// 插电放电：是否断开适配器供电。
+//   开始：接着电源且电量 > 上限；继续：电量 >= 上限，降到"上限 - 1"才停。
+//   停在上限以下 1%，负载消失后电量读数回弹 1% 也不会再次触发。
+//   active 时不看 ac：断开供电后系统本来就报告"使用电池"；用户中途拔电也不影响，到上限以下照样恢复。
+static inline bool policy_discharge(const Conf *c, const Policy *p, int pct, bool active, bool ac) {
+    if (!c->enabled || !c->discharge || p->calibrating) return false;
+    return active ? pct >= c->upper : ac && pct > c->upper;
 }
 
 // 即将睡眠：睡眠中进程不运行，正在往上限充的话先停在当前电量（醒来后恢复）
